@@ -99,7 +99,7 @@ def snippet_words(text: str) -> set[str]:
     return {w for w in re.split(r"\s+", text) if len(w) >= 2}
 
 
-def is_content_duplicate(new_art: dict, accepted: list[dict], threshold: float = 0.55) -> bool:
+def is_content_duplicate(new_art: dict, accepted: list[dict], threshold: float = 0.20) -> bool:
     """Jaccard 유사도로 내용 중복 판별. threshold 이상이면 중복으로 간주."""
     new_words = snippet_words(new_art["snippet"])
     if not new_words:
