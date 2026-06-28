@@ -99,7 +99,7 @@ def snippet_words(text: str) -> set[str]:
     return {w for w in re.split(r"\s+", text) if len(w) >= 2}
 
 
-def is_content_duplicate(new_art: dict, accepted: list[dict], threshold: float = 0.02) -> bool:
+def is_content_duplicate(new_art: dict, accepted: list[dict], threshold: float = 0.05) -> bool:
     """Jaccard 유사도로 내용 중복 판별. threshold 이상이면 중복으로 간주."""
     new_words = snippet_words(new_art["snippet"])
     if not new_words:
@@ -113,6 +113,29 @@ def is_content_duplicate(new_art: dict, accepted: list[dict], threshold: float =
             logger.info("SKIP (duplicate content, %.0f%%): %s", overlap * 100, new_art["title"][:60])
             return True
     return False
+
+
+def fetch_full_title(url: str) -> Optional[str]:
+    """원문 URL에서 <title> 태그로 전체 제목 추출. 실패 시 None 반환."""
+    try:
+        resp = requests.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=5,
+            allow_redirects=True,
+        )
+        resp.raise_for_status()
+        # <title>...</title> 추출
+        m = re.search(r"<title[^>]*>(.*?)</title>", resp.text, re.IGNORECASE | re.DOTALL)
+        if not m:
+            return None
+        raw = m.group(1).strip()
+        # 언론사명 suffix 제거 (예: " | 한국경제", " - 연합뉴스", " :: 머니투데이")
+        raw = re.sub(r"\s*[\|\-:：·]+\s*[^|\-:：·]{2,20}$", "", raw).strip()
+        return html.unescape(raw) or None
+    except Exception as exc:
+        logger.debug("fetch_full_title failed for %s: %s", url, exc)
+        return None
 
 
 def fetch_naver_news(korean_name: str, hours: int) -> list[dict]:
@@ -139,9 +162,17 @@ def fetch_naver_news(korean_name: str, hours: int) -> list[dict]:
             pub = parsedate_to_datetime(item["pubDate"]).astimezone(timezone.utc)
             if pub < cutoff:
                 continue
+            title = strip_html(item.get("title", ""))
+            link  = item.get("originallink") or item.get("link", "")
+            # 제목이 잘린 경우 원문에서 전체 제목 가져오기
+            if title.endswith("...") or title.endswith("…"):
+                full = fetch_full_title(link)
+                if full:
+                    logger.info("Title restored: %s → %s", title[:40], full[:60])
+                    title = full
             articles.append({
-                "title":   strip_html(item.get("title", "")),
-                "link":    item.get("originallink") or item.get("link", ""),
+                "title":   title,
+                "link":    link,
                 "snippet": strip_html(item.get("description", ""))[:600],
             })
         except Exception as exc:
