@@ -7,6 +7,7 @@ Monday window: 72h | Tue–Sun window: 24h
 
 import os
 import re
+import html
 import asyncio
 import logging
 import requests
@@ -80,17 +81,17 @@ def news_window_hours() -> int:
 
 
 def strip_html(text: str) -> str:
-    return re.sub(r"<[^>]+>", "", text).strip()
+    text = re.sub(r"<[^>]+>", "", text)
+    return html.unescape(text).strip()
 
 
 def title_has_company(title: str, keywords: list[str]) -> bool:
     return any(kw.lower() in title.lower() for kw in keywords)
 
 
-def escape_md(text: str) -> str:
-    for ch in ["_", "*", "[", "]", "`"]:
-        text = text.replace(ch, f"\\{ch}")
-    return text
+def escape_html(text: str) -> str:
+    """HTML parse_mode용 이스케이프."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def fetch_naver_news(korean_name: str, hours: int) -> list[dict]:
@@ -180,7 +181,7 @@ def is_relevant(client: anthropic.Anthropic, company_kr: str, company_en: str, t
 def build_article_block(art: dict, client: anthropic.Anthropic) -> str:
     """단일 기사를 포맷팅된 문자열로 반환."""
     summary = summarise(client, art["title"], art["snippet"])
-    return f"*{escape_md(art['title'])}*\n{art['link']}\n{summary}\n"
+    return f"<b>{escape_html(art['title'])}</b>\n{art['link']}\n{summary}\n"
 
 
 def split_into_messages(header: str, blocks: list[str]) -> list[str]:
@@ -242,18 +243,17 @@ async def build_and_send_sector(
     blocks = [build_article_block(art, client) for art in articles]
 
     # 섹터 헤더 (첫 메시지에만)
-    header = f"*{sector}*"
+    header = f"<b>{sector}</b>"
     messages = split_into_messages(header, blocks)
 
     for i, msg in enumerate(messages):
-        # 2번째 메시지부터는 "섹터명 (계속)" 헤더
         if i > 0:
-            msg = f"*{sector} (계속)*\n\n" + msg.lstrip()
+            msg = f"<b>{sector} (계속)</b>\n\n" + msg.lstrip()
         try:
             await bot.send_message(
                 chat_id=CHAT_ID,
                 text=msg,
-                parse_mode="Markdown",
+                parse_mode="HTML",
                 disable_web_page_preview=True,
             )
             await asyncio.sleep(1)
@@ -272,13 +272,13 @@ async def send_news_brief(bot: Bot, client: anthropic.Anthropic) -> None:
     logger.info("Running brief — %s | window: %s", now.strftime("%Y-%m-%d %H:%M KST"), label)
 
     header = (
-        f"*Equity Research News Brief*\n"
-        f"_{now.strftime('%Y.%m.%d %H:%M KST')} · {label}_\n"
+        f"<b>Equity Research News Brief</b>\n"
+        f"<i>{now.strftime('%Y.%m.%d %H:%M KST')} · {label}</i>\n"
         f"{'─' * 30}"
     )
 
     try:
-        await bot.send_message(chat_id=CHAT_ID, text=header, parse_mode="Markdown")
+        await bot.send_message(chat_id=CHAT_ID, text=header, parse_mode="HTML")
     except TelegramError as exc:
         logger.error("Header send failed: %s", exc)
         return
@@ -292,8 +292,8 @@ async def send_news_brief(bot: Bot, client: anthropic.Anthropic) -> None:
     if not found_any:
         await bot.send_message(
             chat_id=CHAT_ID,
-            text="_해당 윈도우 내 새 기사 없음_",
-            parse_mode="Markdown",
+            text="<i>해당 윈도우 내 새 기사 없음</i>",
+            parse_mode="HTML",
         )
 
     logger.info("Brief sent.")
