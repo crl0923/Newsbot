@@ -94,51 +94,25 @@ def escape_html(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def dedupe_with_claude(client: anthropic.Anthropic, articles: list[dict]) -> list[dict]:
-    """
-    Claude가 전체 기사를 한 번에 읽고 내용이 같은 기사 그룹을 묶어,
-    각 그룹에서 대표 1개만 남긴다. 표현·제목이 달라도 의미로 판단.
-    """
-    if len(articles) <= 1:
-        return articles
+def snippet_words(text: str) -> set[str]:
+    """스니펫에서 2글자 이상 단어 추출 (조사·숫자 제외)."""
+    return {w for w in re.split(r"\s+", text) if len(w) >= 2}
 
-    # 번호 매긴 목록 구성 (제목 + 스니펫 앞부분)
-    lines = []
-    for i, art in enumerate(articles):
-        snippet = art["snippet"][:150].replace("\n", " ")
-        lines.append(f"[{i}] {art['title']} :: {snippet}")
-    listing = "\n".join(lines)
 
-    try:
-        resp = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=1000,
-            messages=[{
-                "role": "user",
-                "content": (
-                    "아래는 한국 주식 뉴스 기사 목록입니다. 각 기사는 [번호]로 시작합니다.\n"
-                    "내용이 실질적으로 같은 기사(같은 사건·실적·발표를 다룬 기사)를 그룹으로 묶으세요. "
-                    "제목이나 표현이 달라도 핵심 내용이 같으면 같은 그룹입니다.\n"
-                    "각 그룹에서 가장 정보가 풍부한 기사 1개의 번호만 남기고, 나머지 중복 번호는 제거하세요.\n"
-                    "중복이 없는 기사는 그대로 유지합니다.\n"
-                    "남길 기사들의 번호만 쉼표로 구분해 한 줄로 출력하세요. 다른 텍스트는 쓰지 마세요.\n"
-                    "예시 출력: 0, 2, 3, 5, 7\n\n"
-                    f"{listing}"
-                ),
-            }],
-        )
-        raw = resp.content[0].text.strip()
-        keep_idx = {int(n) for n in re.findall(r"\d+", raw)}
-        kept = [art for i, art in enumerate(articles) if i in keep_idx]
-        removed = len(articles) - len(kept)
-        if kept:
-            logger.info("Claude dedup: %d개 중 %d개 중복 제거 → %d개 유지", len(articles), removed, len(kept))
-            return kept
-        logger.warning("Claude dedup 결과가 비어 있음 — 전체 유지")
-        return articles
-    except Exception as exc:
-        logger.error("Claude dedup 실패 — 전체 유지: %s", exc)
-        return articles
+def is_content_duplicate(new_art: dict, accepted: list[dict], threshold: float = 0.05) -> bool:
+    """Jaccard 유사도로 내용 중복 판별. threshold 이상이면 중복으로 간주."""
+    new_words = snippet_words(new_art["snippet"])
+    if not new_words:
+        return False
+    for art in accepted:
+        existing = snippet_words(art["snippet"])
+        if not existing:
+            continue
+        overlap = len(new_words & existing) / len(new_words | existing)
+        if overlap >= threshold:
+            logger.info("SKIP (duplicate content, %.0f%%): %s", overlap * 100, new_art["title"][:60])
+            return True
+    return False
 
 
 def fetch_full_title(url: str) -> Optional[str]:
@@ -285,14 +259,16 @@ def split_into_messages(header: str, blocks: list[str]) -> list[str]:
 
 
 # ── Message builder ──────────────────────────────────────────────────────────
-def collect_sector(
+async def build_and_send_sector(
+    bot: Bot,
     sector: str,
     companies: list[tuple[str, str, list[str]]],
     hours: int,
     client: anthropic.Anthropic,
     seen_titles: set[str],
-) -> list[dict]:
-    """섹터 기사 수집 + 관련성 필터. 정렬된 기사 리스트 반환 (전송은 안 함)."""
+    accepted_articles: list[dict],
+) -> bool:
+    """섹터 기사 수집 → 중복 제거 → 포맷 → 분할 전송. 기사 있으면 True 반환."""
     priority: list[dict] = []
     normal: list[dict] = []
 
@@ -305,24 +281,19 @@ def collect_sector(
             if not is_relevant(client, korean_name, eng_name, art["title"], art["snippet"]):
                 logger.info("SKIP (irrelevant): %s", art["title"][:60])
                 continue
+            # 내용 중복 필터 — 사이클 내 이미 보낸 기사와 내용이 유사하면 제거
+            if is_content_duplicate(art, accepted_articles):
+                seen_titles.add(key)
+                continue
             seen_titles.add(key)
+            accepted_articles.append(art)
             art["company"] = eng_name
-            art["sector"]  = sector
             if title_has_company(art["title"], keywords):
                 priority.append(art)
             else:
                 normal.append(art)
 
-    return priority + normal
-
-
-async def send_sector(
-    bot: Bot,
-    sector: str,
-    articles: list[dict],
-    client: anthropic.Anthropic,
-) -> bool:
-    """이미 수집·중복제거된 섹터 기사를 포맷 → 분할 전송. 기사 있으면 True."""
+    articles = priority + normal
     if not articles:
         return False
 
@@ -370,24 +341,11 @@ async def send_news_brief(bot: Bot, client: anthropic.Anthropic) -> None:
         logger.error("Header send failed: %s", exc)
         return
 
-    # 1) 전체 섹터에서 기사 수집 (관련성 필터까지)
-    seen_titles: set[str] = set()
-    all_articles: list[dict] = []
-    for sector, companies in COVERAGE.items():
-        all_articles.extend(collect_sector(sector, companies, hours, client, seen_titles))
-
-    # 2) Claude가 전체 기사 중 내용 중복 그룹을 묶어 대표만 남김
-    deduped = dedupe_with_claude(client, all_articles)
-
-    # 3) 섹터별로 다시 묶기 (COVERAGE 순서 유지)
-    by_sector: dict[str, list[dict]] = {sector: [] for sector in COVERAGE}
-    for art in deduped:
-        by_sector.setdefault(art["sector"], []).append(art)
-
-    # 4) 섹터별 전송
     found_any = False
-    for sector in COVERAGE:
-        had_news = await send_sector(bot, sector, by_sector.get(sector, []), client)
+    seen_titles: set[str] = set()       # 제목 기반 중복 제거
+    accepted_articles: list[dict] = []  # 내용 기반 중복 제거용 누적 목록
+    for sector, companies in COVERAGE.items():
+        had_news = await build_and_send_sector(bot, sector, companies, hours, client, seen_titles, accepted_articles)
         if had_news:
             found_any = True
 
