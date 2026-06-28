@@ -94,6 +94,27 @@ def escape_html(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def snippet_words(text: str) -> set[str]:
+    """스니펫에서 2글자 이상 단어 추출 (조사·숫자 제외)."""
+    return {w for w in re.split(r"\s+", text) if len(w) >= 2}
+
+
+def is_content_duplicate(new_art: dict, accepted: list[dict], threshold: float = 0.55) -> bool:
+    """Jaccard 유사도로 내용 중복 판별. threshold 이상이면 중복으로 간주."""
+    new_words = snippet_words(new_art["snippet"])
+    if not new_words:
+        return False
+    for art in accepted:
+        existing = snippet_words(art["snippet"])
+        if not existing:
+            continue
+        overlap = len(new_words & existing) / len(new_words | existing)
+        if overlap >= threshold:
+            logger.info("SKIP (duplicate content, %.0f%%): %s", overlap * 100, new_art["title"][:60])
+            return True
+    return False
+
+
 def fetch_naver_news(korean_name: str, hours: int) -> list[dict]:
     url = "https://openapi.naver.com/v1/search/news.json"
     headers = {
@@ -213,22 +234,28 @@ async def build_and_send_sector(
     companies: list[tuple[str, str, list[str]]],
     hours: int,
     client: anthropic.Anthropic,
+    seen_titles: set[str],
+    accepted_articles: list[dict],
 ) -> bool:
     """섹터 기사 수집 → 포맷 → 필요시 분할 전송. 기사 있으면 True 반환."""
-    seen: set[str] = set()
     priority: list[dict] = []
     normal: list[dict] = []
 
     for korean_name, eng_name, keywords in companies:
         for art in fetch_naver_news(korean_name, hours):
             key = art["title"][:60].lower()
-            if key in seen:
+            if key in seen_titles:
                 continue
             # 관련성 필터 — 무관한 기사 제거
             if not is_relevant(client, korean_name, eng_name, art["title"], art["snippet"]):
                 logger.info("SKIP (irrelevant): %s", art["title"][:60])
                 continue
-            seen.add(key)
+            # 내용 중복 필터 — 사이클 내 이미 보낸 기사와 내용이 유사하면 제거
+            if is_content_duplicate(art, accepted_articles):
+                seen_titles.add(key)
+                continue
+            seen_titles.add(key)
+            accepted_articles.append(art)
             art["company"] = eng_name
             if title_has_company(art["title"], keywords):
                 priority.append(art)
@@ -284,8 +311,10 @@ async def send_news_brief(bot: Bot, client: anthropic.Anthropic) -> None:
         return
 
     found_any = False
+    seen_titles: set[str] = set()       # 제목 기반 중복 제거
+    accepted_articles: list[dict] = []  # 내용 기반 중복 제거용 누적 목록
     for sector, companies in COVERAGE.items():
-        had_news = await build_and_send_sector(bot, sector, companies, hours, client)
+        had_news = await build_and_send_sector(bot, sector, companies, hours, client, seen_titles, accepted_articles)
         if had_news:
             found_any = True
 
