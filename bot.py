@@ -212,7 +212,7 @@ def summarise(client: anthropic.Anthropic, title: str, snippet: str) -> str:
 
 
 def is_relevant(client: anthropic.Anthropic, company_kr: str, company_en: str, title: str, snippet: str) -> bool:
-    """Claude로 관련성 필터. 투자와 무관한 기사(스포츠 스폰서, 사회공헌, 동명 기업 등) 제거."""
+    """Claude로 관련성 필터. 회사 자체에 대한 펀더멘털 후속 기사만 통과."""
     try:
         resp = client.messages.create(
             model="claude-haiku-4-5-20251001",
@@ -220,10 +220,20 @@ def is_relevant(client: anthropic.Anthropic, company_kr: str, company_en: str, t
             messages=[{
                 "role": "user",
                 "content": (
-                    f"당신은 한국 주식 애널리스트입니다. 아래 뉴스가 [{company_kr} / {company_en}] 커버리지 관점에서 "
-                    "읽을 가치가 있는지 판단하세요.\n"
-                    "YES: 실적, 수주, 수출입, 업황, 경쟁, 정책, 제품/기술, M&A, 주가, 재무 관련\n"
-                    "NO: 스포츠 스폰서, 사회공헌, 봉사/행사, 해당 기업과 무관한 동명 기업, 내용 없는 단순 공시\n"
+                    f"당신은 [{company_kr} / {company_en}]를 커버하는 한국 주식 애널리스트입니다. "
+                    "이 기사가 해당 기업을 '팔로업'할 가치가 있는 펀더멘털 뉴스인지 엄격하게 판단하세요.\n\n"
+                    "핵심 원칙: 기업명이 언급된 것만으로는 부족합니다. 기사의 '주제'가 이 기업 자체여야 하고, "
+                    "기업의 사업·실적·전략에 실질적 정보를 줘야 합니다.\n\n"
+                    "YES (통과): 실적/가이던스, 수주·계약, 수출입·생산, 신제품·기술·R&D, 설비투자(capex)·증설, "
+                    "M&A·지분, 업황·전방수요 변화, 규제·정책 영향, 경영전략·인사, 소송·리스크 등 "
+                    "기업 펀더멘털에 영향을 주는 내용.\n\n"
+                    "NO (제외):\n"
+                    "- 단순 주가 등락 기사 ('OO 3% 상승', '52주 신고가', '외국인 순매수 상위' 등 가격/수급만 다룸)\n"
+                    "- 증권사 목표주가·투자의견 리포트 단순 전달 ('OO증권, 매수 유지' 류)\n"
+                    "- 시황·지수 기사에서 종목명만 나열된 경우 (예: '코스피 하락… 삼성SDI·LG엔솔 약세')\n"
+                    "- 스포츠 스폰서, 사회공헌, 봉사/행사, ESG 홍보성\n"
+                    "- 동명이인·동명 기업 등 해당 기업과 무관\n"
+                    "- 내용 없는 단순 공시 알림\n\n"
                     "반드시 YES 또는 NO 한 단어만 출력하세요.\n\n"
                     f"제목: {title}\n내용: {snippet}"
                 ),
