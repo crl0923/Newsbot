@@ -130,8 +130,13 @@ def fetch_full_title(url: str) -> Optional[str]:
         if not m:
             return None
         raw = m.group(1).strip()
-        # 언론사명 suffix 제거 (예: " | 한국경제", " - 연합뉴스", " :: 머니투데이")
-        raw = re.sub(r"\s*[\|\-:：·]+\s*[^|\-:：·]{2,20}$", "", raw).strip()
+        # 1) 사이트 네비게이션 경로 제거 (예: "제목 < 기업PR < 퍼블릭 핫뉴스 < 기사본문")
+        #    첫 '<' 이후 전체를 잘라냄
+        raw = re.split(r"\s*[<>]\s*", raw)[0].strip()
+        # 2) 언론사명 suffix 제거 (예: " | 한국경제", " - 연합뉴스", " :: 머니투데이")
+        #    중간점(·∙)은 한국어 제목에 정상적으로 쓰이므로 구분자에서 제외
+        raw = re.sub(r"\s*[\|:：]+\s*[^|:：]{2,20}$", "", raw).strip()
+        raw = re.sub(r"\s+[\-–—]\s+[^\-–—]{2,15}$", "", raw).strip()
         return html.unescape(raw) or None
     except Exception as exc:
         logger.debug("fetch_full_title failed for %s: %s", url, exc)
