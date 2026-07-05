@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Equity Research News Bot — Naver News + Auto Peers edition
-- 한국 커버리지: 네이버 일반 검색 (기존)
-- 글로벌/일본 Auto peers: Reuters + Automotive News 만 (Google News RSS로 소스 필터링)
+Equity Research News Bot — Naver News edition
+- 한국 커버리지: 네이버 일반 검색
+- 글로벌/일본 Auto peers: 네이버 일반 검색 (한국어 매체 기준)
 Sends sector-grouped Korean news briefs every 4 hours from 06:00 HKT.
 Monday window: 72h | Tue–Sun window: 24h
 """
@@ -14,11 +14,9 @@ import asyncio
 import logging
 import requests
 import anthropic
-import xml.etree.ElementTree as ET
 
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-from urllib.parse import quote_plus
 from typing import Optional
 
 from telegram import Bot
@@ -37,9 +35,6 @@ ANTHROPIC_API_KEY   = os.getenv("ANTHROPIC_API_KEY")
 NAVER_CLIENT_ID     = os.getenv("NAVER_CLIENT_ID")
 NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET")
 KST                 = pytz.timezone("Asia/Seoul")
-
-# peer 기사에 영어 핵심 한 줄 붙일지 여부 (False면 헤드라인+링크만)
-PEER_ADD_KEYLINE = True
 
 logging.basicConfig(
     level=logging.INFO,
@@ -81,25 +76,23 @@ COVERAGE: dict[str, list[tuple[str, str, list[str]]]] = {
     ],
 }
 
-# ── Auto peers (Reuters + Automotive News 만, Google News RSS) ────────────────
-# (표시명, Google News 검색어)  ── 검색어는 노이즈 줄이려고 풀네임 권장
-AUTO_PEERS: dict[str, list[tuple[str, str]]] = {
+# ── Auto peers (네이버 일반 검색) ─────────────────────────────────────────────
+# (표시명, 네이버 검색어(한글), 제목 매칭 키워드)
+# 검색어는 노이즈 줄이려고 국내 표기 기준 풀네임 권장
+AUTO_PEERS: dict[str, list[tuple[str, str, list[str]]]] = {
     "Global Peers": [
-        ("Tesla",          "Tesla"),
-        ("BMW",            "BMW"),
-        ("Volkswagen",     "Volkswagen"),
-        ("GM",             "General Motors"),
-        ("Stellantis",     "Stellantis"),
+        ("Tesla",      "테슬라",       ["테슬라"]),
+        ("BMW",        "BMW",          ["BMW"]),
+        ("Volkswagen", "폭스바겐",     ["폭스바겐", "폴크스바겐"]),
+        ("GM",         "제너럴모터스", ["제너럴모터스", "GM"]),
+        ("Stellantis", "스텔란티스",   ["스텔란티스"]),
     ],
     "Japanese Peers": [
-        ("Toyota",         "Toyota Motor"),
-        ("Honda",          "Honda Motor"),
-        ("Nissan",         "Nissan Motor"),
+        ("Toyota",     "도요타",       ["도요타", "토요타"]),
+        ("Honda",      "혼다",         ["혼다"]),
+        ("Nissan",     "닛산",         ["닛산"]),
     ],
 }
-
-# Google News <source> 태그 기준으로 통과시킬 매체
-PEER_SOURCES = ("Reuters", "Automotive News")
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -207,67 +200,6 @@ def fetch_naver_news(korean_name: str, hours: int) -> list[dict]:
     return articles
 
 
-# ── Google News RSS (Reuters / Automotive News 전용) ──────────────────────────
-def _peer_source_match(name: str, url: str) -> Optional[str]:
-    """RSS <source> 태그가 허용 매체면 정규화된 매체명 반환, 아니면 None."""
-    s = (name or "").lower()
-    u = (url or "").lower()
-    if "reuters" in s or "reuters.com" in u:
-        return "Reuters"
-    if "automotive news" in s or "autonews.com" in u:
-        return "Automotive News"
-    return None
-
-
-def fetch_google_news(query: str, hours: int) -> list[dict]:
-    """Google News RSS 검색 → Reuters/Automotive News 만 남김. 키 불필요."""
-    when = "7d" if hours >= 72 else "2d"   # 넉넉히 가져오고 pubDate로 정밀 컷
-    q = quote_plus(f"{query} when:{when}")
-    url = f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
-
-    try:
-        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-        resp.raise_for_status()
-        root = ET.fromstring(resp.content)
-    except Exception as exc:
-        logger.error("Google News error for '%s': %s", query, exc)
-        return []
-
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-    articles: list[dict] = []
-
-    for item in root.iter("item"):
-        try:
-            src_el   = item.find("source")
-            src_name = src_el.text if src_el is not None else ""
-            src_url  = src_el.get("url") if src_el is not None else ""
-            source   = _peer_source_match(src_name, src_url)
-            if not source:                       # Reuters/AN 아니면 버림
-                continue
-
-            pub_raw = item.findtext("pubDate")
-            pub = parsedate_to_datetime(pub_raw).astimezone(timezone.utc)
-            if pub < cutoff:
-                continue
-
-            title = (item.findtext("title") or "").strip()
-            # Google News는 제목 끝에 " - Reuters" 식으로 매체명을 붙임 → 제거
-            title = re.sub(r"\s+-\s+[^-]+$", "", title).strip() or title
-            link  = (item.findtext("link") or "").strip()
-
-            articles.append({
-                "title":   html.unescape(title),
-                "link":    link,            # google news redirect URL (클릭 시 원문 이동)
-                "snippet": html.unescape(title),  # RSS에 본문 스니펫 없음 → 제목으로 대체
-                "source":  source,
-                "pub":     pub,
-            })
-        except Exception as exc:
-            logger.debug("GNews item parse error for '%s': %s", query, exc)
-
-    return articles
-
-
 # ── Claude: 요약 / 관련성 ─────────────────────────────────────────────────────
 def summarise(client: anthropic.Anthropic, title: str, snippet: str) -> str:
     """핵심 포인트 2개, 요약체 bullet."""
@@ -328,8 +260,8 @@ def is_relevant(client: anthropic.Anthropic, company_kr: str, company_en: str, t
         return True  # 판단 실패 시 포함
 
 
-def is_relevant_peer(client: anthropic.Anthropic, peer: str, title: str) -> bool:
-    """글로벌 peer 관련성 필터. 한국 OEM read-through 관점에서 '중요한 것'만 통과 (제목 기반)."""
+def is_relevant_peer(client: anthropic.Anthropic, peer: str, title: str, snippet: str) -> bool:
+    """글로벌 peer 관련성 필터. 한국 OEM read-through 관점에서 '중요한 것'만 통과."""
     try:
         resp = client.messages.create(
             model="claude-haiku-4-5-20251001",
@@ -338,16 +270,16 @@ def is_relevant_peer(client: anthropic.Anthropic, peer: str, title: str) -> bool
                 "role": "user",
                 "content": (
                     f"당신은 한국 자동차 섹터(현대차·기아 등)를 커버하는 애널리스트입니다. "
-                    f"글로벌 peer [{peer}] 관련 영어 기사 제목입니다. "
+                    f"글로벌 peer [{peer}] 관련 국내 매체 기사입니다. "
                     "한국 OEM 대비 경쟁구도·산업 read-through 관점에서 "
                     "'반드시 팔로업할 만큼 중요한 펀더멘털/전략 뉴스'인지 엄격히 판단하세요.\n\n"
                     "YES: 실적·가이던스, 글로벌 생산·판매 동향, EV·신차·플랫폼 전략, 가격정책·인센티브, "
                     "공급망·관세·통상·정책, 대규모 투자/감산/구조조정/공장, 대형 리콜·소송·파업 등 "
                     "한국 OEM에 시사점 있는 것.\n"
                     "NO: 단순 주가·시총, 증권사 목표주가, 루머·가십, 개별 딜러/지역 행사, "
-                    "단순 모델 리뷰·시승기, 중복성 시황.\n\n"
+                    "단순 모델 리뷰·시승기, 중복성 시황, 해당 기업과 무관한 나열성 기사.\n\n"
                     "반드시 YES 또는 NO 한 단어만.\n\n"
-                    f"제목: {title}"
+                    f"제목: {title}\n내용: {snippet}"
                 ),
             }],
         )
@@ -357,46 +289,11 @@ def is_relevant_peer(client: anthropic.Anthropic, peer: str, title: str) -> bool
         return True
 
 
-def peer_keyline(client: anthropic.Anthropic, peer: str, title: str) -> str:
-    """헤드라인 기반 영어 핵심 한 줄. 추측 금지, 확실한 것만."""
-    try:
-        resp = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=120,
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"You are an equity analyst covering the Korean auto sector. "
-                    f"Below is an English news headline about a global peer [{peer}]. "
-                    "Write ONE concise English line (under ~20 words) capturing the key takeaway. "
-                    "If a clear read-through for Korean OEMs (Hyundai/Kia) is evident, note it briefly; "
-                    "otherwise just state the core fact. Do NOT speculate beyond the headline. "
-                    "Output the single line only, no bullets, no extra text.\n\n"
-                    f"Headline: {title}"
-                ),
-            }],
-        )
-        return resp.content[0].text.strip().split("\n")[0]
-    except Exception as exc:
-        logger.error("Peer keyline failed: %s", exc)
-        return ""
-
-
 # ── Block / message builders ─────────────────────────────────────────────────
 def build_article_block(art: dict, client: anthropic.Anthropic) -> str:
-    """단일 기사를 포맷팅된 문자열로 반환 (네이버 커버리지용)."""
+    """단일 기사를 포맷팅된 문자열로 반환."""
     summary = summarise(client, art["title"], art["snippet"])
     return f"<b>{escape_html(art['title'])}</b>\n{art['link']}\n{summary}\n"
-
-
-def build_peer_block(art: dict, client: anthropic.Anthropic) -> str:
-    """peer 기사 블록: 헤드라인 + 매체 + 링크 (+선택적 영어 핵심 한 줄)."""
-    line = f"<b>{escape_html(art['title'])}</b>\n<i>{art['source']}</i> · {art['link']}\n"
-    if PEER_ADD_KEYLINE:
-        key = peer_keyline(client, art["company"], art["title"])
-        if key:
-            line += f"- {escape_html(key)}\n"
-    return line
 
 
 def split_into_messages(header: str, blocks: list[str]) -> list[str]:
@@ -476,31 +373,40 @@ async def build_and_send_sector(
 async def build_and_send_peers(
     bot: Bot,
     group: str,
-    peers: list[tuple[str, str]],
+    peers: list[tuple[str, str, list[str]]],
     hours: int,
     client: anthropic.Anthropic,
     seen_titles: set[str],
+    accepted_articles: list[dict],
 ) -> bool:
-    """Auto peer 그룹: Reuters/AN 기사 수집 → 관련성 필터 → 전송. 기사 있으면 True."""
-    collected: list[dict] = []
+    """Auto peer 그룹: 네이버 기사 수집 → 관련성/중복 필터 → 전송. 기사 있으면 True."""
+    priority: list[dict] = []
+    normal: list[dict] = []
 
-    for peer_label, query in peers:
-        for art in fetch_google_news(query, hours):
+    for peer_label, korean_name, keywords in peers:
+        for art in fetch_naver_news(korean_name, hours):
             key = art["title"][:60].lower()
             if key in seen_titles:
                 continue
-            if not is_relevant_peer(client, peer_label, art["title"]):
+            if not is_relevant_peer(client, peer_label, art["title"], art["snippet"]):
                 logger.info("SKIP peer (irrelevant): %s", art["title"][:60])
                 continue
+            if is_content_duplicate(art, accepted_articles):
+                seen_titles.add(key)
+                continue
             seen_titles.add(key)
+            accepted_articles.append(art)
             art["company"] = peer_label
-            collected.append(art)
+            if title_has_company(art["title"], keywords):
+                priority.append(art)
+            else:
+                normal.append(art)
 
-    if not collected:
+    articles = priority + normal
+    if not articles:
         return False
 
-    collected.sort(key=lambda a: a["pub"], reverse=True)  # 최신순
-    blocks = [build_peer_block(art, client) for art in collected]
+    blocks = [build_article_block(art, client) for art in articles]
     header = f"<b>Auto Peers — {group}</b>"
     messages = split_into_messages(header, blocks)
 
@@ -548,9 +454,9 @@ async def send_news_brief(bot: Bot, client: anthropic.Anthropic) -> None:
         if await build_and_send_sector(bot, sector, companies, hours, client, seen_titles, accepted_articles):
             found_any = True
 
-    # 2) Auto peers (Reuters + Automotive News)
+    # 2) Auto peers (네이버)
     for group, peers in AUTO_PEERS.items():
-        if await build_and_send_peers(bot, group, peers, hours, client, seen_titles):
+        if await build_and_send_peers(bot, group, peers, hours, client, seen_titles, accepted_articles):
             found_any = True
 
     if not found_any:
