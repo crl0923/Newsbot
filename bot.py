@@ -290,10 +290,13 @@ def is_relevant_peer(client: anthropic.Anthropic, peer: str, title: str, snippet
 
 
 # ── Block / message builders ─────────────────────────────────────────────────
+TITLE_MARK = "■"  # 제목 앞 기호 (볼드 풀려도 제목 구분용). 원하면 ◾ / ▪️ / 🔹 등으로 변경
+
+
 def build_article_block(art: dict, client: anthropic.Anthropic) -> str:
     """단일 기사를 포맷팅된 문자열로 반환."""
     summary = summarise(client, art["title"], art["snippet"])
-    return f"<b>{escape_html(art['title'])}</b>\n{art['link']}\n{summary}\n"
+    return f"{TITLE_MARK} <b>{escape_html(art['title'])}</b>\n{art['link']}\n{summary}\n"
 
 
 def split_into_messages(header: str, blocks: list[str]) -> list[str]:
