@@ -43,6 +43,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TELEGRAM_MAX_CHARS = 3800  # 텔레그램 한도 4096에서 여유 확보
+MAX_PER_COMPANY    = 3     # ★ 회사(peer)당 최대 기사 수 — 뉴스 볼륨 통제용. None이면 무제한
+DEDUP_THRESHOLD    = 0.05  # ★ Jaccard 유사도 임계값. 낮출수록(예: 0.03) 더 공격적으로 중복 제거
 
 # ── Coverage universe (네이버 일반 검색) ──────────────────────────────────────
 COVERAGE: dict[str, list[tuple[str, str, list[str]]]] = {
@@ -101,8 +103,16 @@ def news_window_hours() -> int:
 
 
 def strip_html(text: str) -> str:
+    """태그 제거 + 엔티티 완전 디코딩.
+    ★ 네이버 API는 &amp;quot; 처럼 이중 인코딩해서 주는 경우가 있어,
+      더 이상 변하지 않을 때까지(최대 3회) 반복 디코딩한다."""
     text = re.sub(r"<[^>]+>", "", text)
-    return html.unescape(text).strip()
+    for _ in range(3):
+        decoded = html.unescape(text)
+        if decoded == text:
+            break
+        text = decoded
+    return text.strip()
 
 
 def title_has_company(title: str, keywords: list[str]) -> bool:
@@ -110,16 +120,18 @@ def title_has_company(title: str, keywords: list[str]) -> bool:
 
 
 def escape_html(text: str) -> str:
-    """HTML parse_mode용 이스케이프."""
+    """HTML parse_mode용 이스케이프. (반드시 & 먼저)"""
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def snippet_words(text: str) -> set[str]:
-    """스니펫에서 2글자 이상 단어 추출 (조사·숫자 제외)."""
-    return {w for w in re.split(r"\s+", text) if len(w) >= 2}
+    """스니펫에서 2글자 이상 단어 추출.
+    ★ 구두점·기호를 공백으로 치환해 조사/기호 노이즈를 줄여 중복 판별 정확도를 높인다."""
+    text = re.sub(r"[^0-9A-Za-z가-힣]+", " ", text)
+    return {w for w in text.split() if len(w) >= 2}
 
 
-def is_content_duplicate(new_art: dict, accepted: list[dict], threshold: float = 0.05) -> bool:
+def is_content_duplicate(new_art: dict, accepted: list[dict], threshold: float = DEDUP_THRESHOLD) -> bool:
     """Jaccard 유사도로 내용 중복 판별. threshold 이상이면 중복으로 간주."""
     new_words = snippet_words(new_art["snippet"])
     if not new_words:
@@ -152,7 +164,13 @@ def fetch_full_title(url: str) -> Optional[str]:
         raw = re.split(r"\s*[<>]\s*", raw)[0].strip()
         raw = re.sub(r"\s*[\|:：]+\s*[^|:：]{2,20}$", "", raw).strip()
         raw = re.sub(r"\s+[\-–—]\s+[^\-–—]{2,15}$", "", raw).strip()
-        return html.unescape(raw) or None
+        # ★ 여기도 완전 디코딩
+        for _ in range(3):
+            decoded = html.unescape(raw)
+            if decoded == raw:
+                break
+            raw = decoded
+        return raw or None
     except Exception as exc:
         logger.debug("fetch_full_title failed for %s: %s", url, exc)
         return None
@@ -294,9 +312,14 @@ TITLE_MARK = "■"  # 제목 앞 기호 (볼드 풀려도 제목 구분용). 원
 
 
 def build_article_block(art: dict, client: anthropic.Anthropic) -> str:
-    """단일 기사를 포맷팅된 문자열로 반환."""
+    """단일 기사를 포맷팅된 문자열로 반환.
+    ★ 제목·링크·요약 모두 escape_html 처리 → 텔레그램 HTML 파서가 깨지지 않도록."""
     summary = summarise(client, art["title"], art["snippet"])
-    return f"{TITLE_MARK} <b>{escape_html(art['title'])}</b>\n{art['link']}\n{summary}\n"
+    return (
+        f"{TITLE_MARK} <b>{escape_html(art['title'])}</b>\n"
+        f"{escape_html(art['link'])}\n"
+        f"{escape_html(summary)}\n"
+    )
 
 
 def split_into_messages(header: str, blocks: list[str]) -> list[str]:
@@ -332,7 +355,10 @@ async def build_and_send_sector(
     normal: list[dict] = []
 
     for korean_name, eng_name, keywords in companies:
+        company_count = 0  # ★ 회사당 상한 카운터
         for art in fetch_naver_news(korean_name, hours):
+            if MAX_PER_COMPANY is not None and company_count >= MAX_PER_COMPANY:
+                break
             key = art["title"][:60].lower()
             if key in seen_titles:
                 continue
@@ -344,6 +370,7 @@ async def build_and_send_sector(
                 continue
             seen_titles.add(key)
             accepted_articles.append(art)
+            company_count += 1
             art["company"] = eng_name
             if title_has_company(art["title"], keywords):
                 priority.append(art)
@@ -355,12 +382,12 @@ async def build_and_send_sector(
         return False
 
     blocks = [build_article_block(art, client) for art in articles]
-    header = f"<b>{sector}</b>"
+    header = f"<b>{escape_html(sector)}</b>"
     messages = split_into_messages(header, blocks)
 
     for i, msg in enumerate(messages):
         if i > 0:
-            msg = f"<b>{sector} (계속)</b>\n\n" + msg.lstrip()
+            msg = f"<b>{escape_html(sector)} (계속)</b>\n\n" + msg.lstrip()
         try:
             await bot.send_message(
                 chat_id=CHAT_ID, text=msg, parse_mode="HTML",
@@ -387,7 +414,10 @@ async def build_and_send_peers(
     normal: list[dict] = []
 
     for peer_label, korean_name, keywords in peers:
+        company_count = 0  # ★ peer당 상한 카운터
         for art in fetch_naver_news(korean_name, hours):
+            if MAX_PER_COMPANY is not None and company_count >= MAX_PER_COMPANY:
+                break
             key = art["title"][:60].lower()
             if key in seen_titles:
                 continue
@@ -399,6 +429,7 @@ async def build_and_send_peers(
                 continue
             seen_titles.add(key)
             accepted_articles.append(art)
+            company_count += 1
             art["company"] = peer_label
             if title_has_company(art["title"], keywords):
                 priority.append(art)
@@ -410,12 +441,12 @@ async def build_and_send_peers(
         return False
 
     blocks = [build_article_block(art, client) for art in articles]
-    header = f"<b>Auto Peers — {group}</b>"
+    header = f"<b>Auto Peers — {escape_html(group)}</b>"
     messages = split_into_messages(header, blocks)
 
     for i, msg in enumerate(messages):
         if i > 0:
-            msg = f"<b>Auto Peers — {group} (계속)</b>\n\n" + msg.lstrip()
+            msg = f"<b>Auto Peers — {escape_html(group)} (계속)</b>\n\n" + msg.lstrip()
         try:
             await bot.send_message(
                 chat_id=CHAT_ID, text=msg, parse_mode="HTML",
