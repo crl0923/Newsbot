@@ -1,0 +1,68 @@
+# 리포지토리의  .github/workflows/news.yml  경로에 두세요.
+# (이 파일명 그대로 두면 Actions 가 인식하지 않습니다 — 반드시 위 경로로 이동)
+#
+# cron 은 UTC 기준입니다. KST = UTC + 9, 서머타임 없음:
+#   21:00 UTC → 다음날 06:00 KST
+#
+# ★ 기존 news.yml 대비 바뀐 점 3가지
+#   1) cron 을 "0 21,4,9" → "0 21" 로. 하루 1회(06:00 KST)만 발송.
+#   2) bot.py 를 항상 --now 로 실행. 이유는 아래 "왜 --now 인가" 참고.
+#   3) LLM_PROVIDER 와 groq/anthropic 키를 env 로 전달. 없으면 provider 를
+#      바꿔도 Actions 에서는 계속 스니펫 요약으로 떨어진다.
+
+name: News Run
+
+on:
+  schedule:
+    - cron: "0 21 * * *"      # 06:00 KST 매일
+  workflow_dispatch:           # Actions 탭에서 수동 실행 버튼
+
+jobs:
+  brief:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # seen.json 을 실행 간에 보존해 같은 기사가 반복 발송되는 것을 막습니다.
+      # (Actions 는 매 실행이 새 머신이라 캐시가 없으면 기억이 사라집니다)
+      # restore-keys 의 "seen-" 접두어가 가장 최근 캐시를 끌어옵니다.
+      - name: Restore seen.json
+        uses: actions/cache/restore@v4
+        with:
+          path: seen.json
+          key: seen-${{ github.run_id }}
+          restore-keys: seen-
+
+      # ── 왜 --now 인가 ────────────────────────────────────────────────────
+      # GitHub 의 예약 실행은 러너가 붐비면 수 분~수십 분 밀립니다. 21:00 UTC
+      # 예약이 22:0x UTC(=07:0x KST)에 뜨면, bot.py 의 SEND_HOURS={6} 게이트에
+      # 걸려 "발송 시간대가 아닙니다" 로그만 남기고 그날 브리프가 사라집니다.
+      # 스케줄은 위 cron 한 곳에서만 관리하고, 실행되면 무조건 보냅니다.
+      # (SKIP_WEEKEND 는 --now 여도 bot.py 안에서 그대로 적용됩니다)
+      - name: Send brief
+        env:
+          TELEGRAM_BOT_TOKEN:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
+          NAVER_CLIENT_ID:     ${{ secrets.NAVER_CLIENT_ID }}
+          NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
+          LLM_PROVIDER:        ${{ vars.LLM_PROVIDER || 'gemini' }}
+          GEMINI_API_KEY:      ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY:        ${{ secrets.GROQ_API_KEY }}
+          ANTHROPIC_API_KEY:   ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python bot.py --now
+
+      - name: Save seen.json
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: seen.json
+          key: seen-${{ github.run_id }}
