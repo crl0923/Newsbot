@@ -4,11 +4,15 @@
 # cron 은 UTC 기준입니다. KST = UTC + 9, 서머타임 없음:
 #   21:00 UTC → 다음날 06:00 KST
 #
-# ★ 기존 news.yml 대비 바뀐 점 3가지
-#   1) cron 을 "0 21,4,9" → "0 21" 로. 하루 1회(06:00 KST)만 발송.
-#   2) bot.py 를 항상 --now 로 실행. 이유는 아래 "왜 --now 인가" 참고.
-#   3) LLM_PROVIDER 와 groq/anthropic 키를 env 로 전달. 없으면 provider 를
-#      바꿔도 Actions 에서는 계속 스니펫 요약으로 떨어진다.
+# ★ 브리프는 두 개로 분리되어 있습니다 (matrix.group).
+#     auto  : 한국 자동차·자동차부품 + European automakers
+#     other : EV/Battery, Construction, Shipbuilding
+#   - seen 파일과 캐시 키가 그룹별로 분리됩니다. 같이 쓰면 나중에 끝난 잡의
+#     캐시가 앞의 것을 덮어써 중복 발송이 되살아납니다.
+#   - max-parallel: 1 — 같은 텔레그램 방으로 보내므로 동시에 돌리면 두 브리프의
+#     메시지가 서로 섞여서 도착합니다. auto 를 먼저 끝내고 other 를 보냅니다.
+#   - 두 브리프를 다른 시각에 받고 싶으면 matrix 를 지우고 이 잡을 복사해
+#     각각 cron 과 --group 을 다르게 두세요.
 
 name: News Run
 
@@ -16,31 +20,59 @@ on:
   schedule:
     - cron: "0 21 * * *"      # 06:00 KST 매일
   workflow_dispatch:           # Actions 탭에서 수동 실행 버튼
+    inputs:
+      group:
+        description: "발송할 브리프 (auto | other | all)"
+        type: choice
+        default: all
+        options: [all, auto, other]
 
 jobs:
   brief:
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        group: [auto, other]
+
     steps:
+      # 수동 실행에서 한쪽만 고른 경우 나머지 잡은 건너뜁니다.
+      - name: Should run?
+        id: gate
+        run: |
+          want="${{ github.event.inputs.group || 'all' }}"
+          if [ "$want" = "all" ] || [ "$want" = "${{ matrix.group }}" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "skip ${{ matrix.group }} (요청: $want)"
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.gate.outputs.run == 'true'
 
       - uses: actions/setup-python@v5
+        if: steps.gate.outputs.run == 'true'
         with:
           python-version: "3.12"
           cache: pip
 
       - run: pip install -r requirements.txt
+        if: steps.gate.outputs.run == 'true'
 
-      # seen.json 을 실행 간에 보존해 같은 기사가 반복 발송되는 것을 막습니다.
+      # seen-<group>.json 을 실행 간에 보존해 같은 기사가 반복 발송되는 것을 막습니다.
       # (Actions 는 매 실행이 새 머신이라 캐시가 없으면 기억이 사라집니다)
-      # restore-keys 의 "seen-" 접두어가 가장 최근 캐시를 끌어옵니다.
-      - name: Restore seen.json
+      # restore-keys 의 "seen-<group>-" 접두어가 그 그룹의 가장 최근 캐시를 끌어옵니다.
+      - name: Restore seen file
+        if: steps.gate.outputs.run == 'true'
         uses: actions/cache/restore@v4
         with:
-          path: seen.json
-          key: seen-${{ github.run_id }}
-          restore-keys: seen-
+          path: seen-${{ matrix.group }}.json
+          key: seen-${{ matrix.group }}-${{ github.run_id }}
+          restore-keys: seen-${{ matrix.group }}-
 
       # ── 왜 --now 인가 ────────────────────────────────────────────────────
       # GitHub 의 예약 실행은 러너가 붐비면 수 분~수십 분 밀립니다. 21:00 UTC
@@ -48,7 +80,8 @@ jobs:
       # 걸려 "발송 시간대가 아닙니다" 로그만 남기고 그날 브리프가 사라집니다.
       # 스케줄은 위 cron 한 곳에서만 관리하고, 실행되면 무조건 보냅니다.
       # (SKIP_WEEKEND 는 --now 여도 bot.py 안에서 그대로 적용됩니다)
-      - name: Send brief
+      - name: Send brief (${{ matrix.group }})
+        if: steps.gate.outputs.run == 'true'
         env:
           TELEGRAM_BOT_TOKEN:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -58,11 +91,11 @@ jobs:
           GEMINI_API_KEY:      ${{ secrets.GEMINI_API_KEY }}
           GROQ_API_KEY:        ${{ secrets.GROQ_API_KEY }}
           ANTHROPIC_API_KEY:   ${{ secrets.ANTHROPIC_API_KEY }}
-        run: python bot.py --now
+        run: python bot.py --now --group ${{ matrix.group }}
 
-      - name: Save seen.json
-        if: always()
+      - name: Save seen file
+        if: always() && steps.gate.outputs.run == 'true'
         uses: actions/cache/save@v4
         with:
-          path: seen.json
-          key: seen-${{ github.run_id }}
+          path: seen-${{ matrix.group }}.json
+          key: seen-${{ matrix.group }}-${{ github.run_id }}
