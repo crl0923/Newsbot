@@ -1,103 +1,73 @@
-# 리포지토리의  .github/workflows/news.yml  경로에 두세요.
-# (이 파일명 그대로 두면 Actions 가 인식하지 않습니다 — 반드시 위 경로로 이동)
-#
-# cron 은 UTC 기준입니다. KST = UTC + 9, 서머타임 없음:
-#   21:00 UTC → 다음날 06:00 KST
-#
-# ★ 브리프는 두 개로 분리되어 있습니다 (matrix.group).
-#     auto  : 한국 자동차·자동차부품 + European automakers
-#     other : EV/Battery, Construction, Shipbuilding
-#   - seen 파일과 캐시 키가 그룹별로 분리됩니다. 같이 쓰면 나중에 끝난 잡의
-#     캐시가 앞의 것을 덮어써 중복 발송이 되살아납니다.
-#   - max-parallel: 1 — 같은 텔레그램 방으로 보내므로 동시에 돌리면 두 브리프의
-#     메시지가 서로 섞여서 도착합니다. auto 를 먼저 끝내고 other 를 보냅니다.
-#   - 두 브리프를 다른 시각에 받고 싶으면 matrix 를 지우고 이 잡을 복사해
-#     각각 cron 과 --group 을 다르게 두세요.
-
-name: News Run
+name: news-brief
 
 on:
   schedule:
-    - cron: "0 21 * * *"      # 06:00 KST 매일
-  workflow_dispatch:           # Actions 탭에서 수동 실행 버튼
+    # 05:37 KST (= 20:37 UTC). 준비를 끝내고 bot.py 가 06:00 까지 기다렸다 발송한다.
+    # ★ cron 줄은 이것 하나만. 줄이 여러 개면 그 수만큼 실행된다.
+    - cron: "37 20 * * *"
+  workflow_dispatch:
     inputs:
-      group:
-        description: "발송할 브리프 (auto | other | all)"
-        type: choice
-        default: all
-        options: [all, auto, other]
+      force:
+        description: "오늘 이미 보냈어도 다시 발송"
+        type: boolean
+        default: false
+
+# 같은 워크플로가 겹쳐 돌지 않게 한다 (cron 과 수동 실행이 겹치는 경우 등)
+concurrency:
+  group: news-brief
+  cancel-in-progress: false
 
 jobs:
   brief:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-
-    strategy:
-      max-parallel: 1
-      fail-fast: false
-      matrix:
-        group: [auto, other]
-
+    timeout-minutes: 60
     steps:
-      # 수동 실행에서 한쪽만 고른 경우 나머지 잡은 건너뜁니다.
-      - name: Should run?
-        id: gate
-        run: |
-          want="${{ github.event.inputs.group || 'all' }}"
-          if [ "$want" = "all" ] || [ "$want" = "${{ matrix.group }}" ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "skip ${{ matrix.group }} (요청: $want)"
-          fi
-
       - uses: actions/checkout@v4
-        if: steps.gate.outputs.run == 'true'
 
       - uses: actions/setup-python@v5
-        if: steps.gate.outputs.run == 'true'
         with:
           python-version: "3.12"
           cache: pip
 
       - run: pip install -r requirements.txt
-        if: steps.gate.outputs.run == 'true'
 
-      # seen-<group>.json 을 실행 간에 보존해 같은 기사가 반복 발송되는 것을 막습니다.
-      # (Actions 는 매 실행이 새 머신이라 캐시가 없으면 기억이 사라집니다)
-      # restore-keys 의 "seen-<group>-" 접두어가 그 그룹의 가장 최근 캐시를 끌어옵니다.
-      - name: Restore seen file
-        if: steps.gate.outputs.run == 'true'
-        uses: actions/cache/restore@v4
+      # Claude 구독으로 LLM 을 쓰기 위한 CLI
+      - uses: actions/setup-node@v4
         with:
-          path: seen-${{ matrix.group }}.json
-          key: seen-${{ matrix.group }}-${{ github.run_id }}
-          restore-keys: seen-${{ matrix.group }}-
+          node-version: "20"
+      - run: npm install -g @anthropic-ai/claude-code
 
-      # ── 왜 --now 인가 ────────────────────────────────────────────────────
-      # GitHub 의 예약 실행은 러너가 붐비면 수 분~수십 분 밀립니다. 21:00 UTC
-      # 예약이 22:0x UTC(=07:0x KST)에 뜨면, bot.py 의 SEND_HOURS={6} 게이트에
-      # 걸려 "발송 시간대가 아닙니다" 로그만 남기고 그날 브리프가 사라집니다.
-      # 스케줄은 위 cron 한 곳에서만 관리하고, 실행되면 무조건 보냅니다.
-      # (SKIP_WEEKEND 는 --now 여도 bot.py 안에서 그대로 적용됩니다)
-      - name: Send brief (${{ matrix.group }})
-        if: steps.gate.outputs.run == 'true'
+      # seen-auto.json / seen-other.json 복원 (실행 간 중복 방지 + 하루 1회 가드)
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            seen-auto.json
+            seen-other.json
+          key: seen-${{ github.run_id }}
+          restore-keys: seen-
+
+      - name: Run bot
         env:
-          TELEGRAM_BOT_TOKEN:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
-          NAVER_CLIENT_ID:     ${{ secrets.NAVER_CLIENT_ID }}
-          NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
-          LLM_PROVIDER:        ${{ vars.LLM_PROVIDER || 'gemini' }}
-          # en(기본) | ko | both — Settings > Variables 에서 바꿀 수 있습니다.
-          BRIEF_LANG:          ${{ vars.BRIEF_LANG || 'en' }}
-          GEMINI_API_KEY:      ${{ secrets.GEMINI_API_KEY }}
-          GROQ_API_KEY:        ${{ secrets.GROQ_API_KEY }}
-          ANTHROPIC_API_KEY:   ${{ secrets.ANTHROPIC_API_KEY }}
-        run: python bot.py --now --group ${{ matrix.group }}
+          TELEGRAM_BOT_TOKEN:      ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:        ${{ secrets.TELEGRAM_CHAT_ID }}
+          NAVER_CLIENT_ID:         ${{ secrets.NAVER_CLIENT_ID }}
+          NAVER_CLIENT_SECRET:     ${{ secrets.NAVER_CLIENT_SECRET }}
+          LLM_PROVIDER:            claude_code
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          CLAUDE_CODE_MODEL:       haiku
+          SEND_AT:                 "06:00"
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            EXTRA="--no-hold"
+            [ "${{ inputs.force }}" = "true" ] && EXTRA="$EXTRA --force-send"
+          fi
+          python bot.py --now --group all $EXTRA
 
-      - name: Save seen file
-        if: always() && steps.gate.outputs.run == 'true'
-        uses: actions/cache/save@v4
+      # 봇이 실패해도 seen 은 저장한다 (발송된 기사가 다음 날 또 오지 않게)
+      - uses: actions/cache/save@v4
+        if: always()
         with:
-          path: seen-${{ matrix.group }}.json
-          key: seen-${{ matrix.group }}-${{ github.run_id }}
+          path: |
+            seen-auto.json
+            seen-other.json
+          key: seen-${{ github.run_id }}
