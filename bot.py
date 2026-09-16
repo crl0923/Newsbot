@@ -6,7 +6,7 @@ Equity Research News Bot — Naver News + LLM (공급자 교체 가능)
     auto  : 한국 자동차·자동차부품 + European automakers
     other : EV/Battery, Construction, Shipbuilding
 - 본문: 기사 첫 두 문장을 '그대로' 발췌한다(모델이 쓰는 요약이 아니다).
-- 언어: 기본 영어. 발췌한 두 문장을 LLM 이 '번역'만 한다 (BRIEF_LANG=ko|both).
+- 언어: 기본 한국어 원문 (2026-09-16). BRIEF_LANG=en|both 면 LLM 이 '번역'만 한다.
 - LLM: Claude 구독(claude_code) / Anthropic API / Gemini / Groq 중 택1
   (LLM_PROVIDER 환경변수, 기본 claude_code).
   키가 없거나 한도 초과여도 봇은 멈추지 않고 한국어 원문으로 발송된다.
@@ -82,7 +82,11 @@ except Exception:
     KST = timezone(timedelta(hours=9))
 
 TELEGRAM_MAX_CHARS = 3800
-MAX_PER_COMPANY    = 3        # 회사(peer)당 최대 기사 수
+MAX_PER_COMPANY    = 3        # 회사(peer)당 최대 '발송' 기사 수 (판정 후 적용)
+# ★ 2026-09-16: 예전엔 수집 단계에서 3건을 채우고 판정했다. 홍보 기사 3건이
+#   칸을 다 차지하면 그 회사의 진짜 뉴스는 심사조차 못 받았다. 이제 후보를
+#   넉넉히 모아 판정한 뒤, 통과한 것 중에서 3건을 고른다.
+CANDIDATES_PER_COMPANY = 6
 SKIP_WEEKEND       = False    # True 로 두면 토/일 미발송
 SEND_HOURS         = {6}      # KST 기준 발송 허용 '정시대' — 매일 06:00 1회 (--now 없을 때만)
 
@@ -127,7 +131,7 @@ SUMMARY_MAX_CHARS = 80   # 폴백(스니펫) 경로에서만 쓰인다
 #   길이 제한에 맞추려고 모델이 문장을 스스로 잘라내기도 한다. 이제는
 #   기사 본문의 첫 두 문장을 '그대로' 가져온 뒤, 번역만 시킨다. 문체는
 #   원문(=기사 리드)이 정하고 모델은 옮기기만 하므로 편차가 없다.
-# ★ 브리프 언어는 영어가 기본. BRIEF_LANG=ko 면 번역 없이 한국어 원문,
+# ★ 브리프 언어는 한국어가 기본. BRIEF_LANG=en 이면 영어 번역,
 #   both 면 영어 아래에 한국어 원제를 같이 붙인다.
 LEAD_SENTENCES  = 2      # 가져올 문장 수
 LEAD_MAX_CHARS  = 240    # 한 문장이 이보다 길면 어절 경계에서 자른다
@@ -135,7 +139,9 @@ LEAD_FETCH      = os.getenv("LEAD_FETCH", "1") != "0"   # 0 이면 스니펫만 
 LEAD_TIMEOUT    = 8
 LEAD_WORKERS    = 8      # ★ 본문 fetch 동시 실행 수 (예전엔 한 건씩 순차)
 TRANSLATE_BATCH = 10     # 한 건당 출력 ~100토큰 → 10건이어도 한도에 여유
-BRIEF_LANG      = os.getenv("BRIEF_LANG", "en").strip().lower()   # en | ko | both
+# ★ 2026-09-16: 기본값을 ko 로. 번역이 배치 단위로 실패하면 영어·한국어가
+#   섞여 나가서 읽기 불편했다. ko 면 번역 호출 자체가 없어 더 빠르다.
+BRIEF_LANG      = os.getenv("BRIEF_LANG", "ko").strip().lower()   # ko | en | both
 
 PROVIDERS = {
     # interval 0 — CLI 기동 자체에 몇 초가 걸리므로 따로 쉴 필요가 없다.
@@ -179,12 +185,12 @@ EUROPEAN_AUTO = [
 ]
 
 AUTO_COVERAGE: dict[str, dict] = {
-    "Korea Auto / Auto Parts": {
+    "한국 자동차·부품": {
         "peer": False,
         "context": "한국 자동차·자동차부품 섹터",
         "entries": KOREA_AUTO,
     },
-    "European Automakers": {
+    "유럽 완성차": {
         "peer": True,
         "context": "유럽 완성차(OEM) 업종 — 한국 자동차 섹터와의 경쟁구도·전방수요 관점",
         "entries": EUROPEAN_AUTO,
@@ -192,7 +198,7 @@ AUTO_COVERAGE: dict[str, dict] = {
 }
 
 OTHER_COVERAGE: dict[str, dict] = {
-    "EV / Battery": {
+    "2차전지": {
         "peer": False,
         "context": "한국 주식 2차전지 섹터",
         "entries": [
@@ -203,7 +209,7 @@ OTHER_COVERAGE: dict[str, dict] = {
             ("L&F",                "엘앤에프",       ["엘앤에프", "L&F"]),
         ],
     },
-    "Construction": {
+    "건설": {
         "peer": False,
         "context": "한국 주식 건설 섹터",
         "entries": [
@@ -213,7 +219,7 @@ OTHER_COVERAGE: dict[str, dict] = {
             ("Samsung C&T", "삼성물산", ["삼성물산"]),
         ],
     },
-    "Shipbuilding": {
+    "조선": {
         "peer": False,
         "context": "한국 주식 조선 섹터",
         "entries": [
@@ -228,8 +234,8 @@ OTHER_COVERAGE: dict[str, dict] = {
 
 # --group 으로 고르는 실행 단위. 각각 별도의 seen 파일 / 별도의 Actions 잡.
 GROUPS: dict[str, dict] = {
-    "auto":  {"title": "Auto News Brief",     "coverage": AUTO_COVERAGE},
-    "other": {"title": "Non-Auto News Brief", "coverage": OTHER_COVERAGE},
+    "auto":  {"title": "자동차 뉴스 브리프",     "coverage": AUTO_COVERAGE},
+    "other": {"title": "비자동차 뉴스 브리프", "coverage": OTHER_COVERAGE},
 }
 
 # ── 규칙 기반 노이즈 필터 ─────────────────────────────────────────────────────
@@ -348,7 +354,32 @@ def snippet_words(text: str) -> set[str]:
     return {w for w in text.split() if len(w) >= 2}
 
 
+TITLE_DUP_THRESHOLD = 0.5
+
+
+def _title_bigrams(title: str) -> set[str]:
+    t = re.sub(r"[^0-9A-Za-z가-힣]+", "", title).lower()
+    return {t[i:i + 2] for i in range(len(t) - 1)}
+
+
+def is_title_duplicate(title: str, accepted: list[dict]) -> bool:
+    """★ 2026-09-16: 같은 보도자료를 매체마다 조금씩 다르게 쓴 기사.
+    본문 첫머리가 달라 스니펫 비교로는 안 잡히므로 제목 글자 bigram 으로 본다.
+    ('한국타이어 다이나프로 신규 브랜드 필름 공개' 가 3건 연속 온 사례)"""
+    new = _title_bigrams(title)
+    if len(new) < 6:
+        return False
+    for art in accepted:
+        old = art.get("_bigrams") or _title_bigrams(art["title"])
+        art["_bigrams"] = old
+        if old and len(new & old) / len(new | old) >= TITLE_DUP_THRESHOLD:
+            return True
+    return False
+
+
 def is_content_duplicate(new_art: dict, accepted: list[dict]) -> bool:
+    if is_title_duplicate(new_art["title"], accepted):
+        return True
     new_words = snippet_words(new_art["snippet"])
     if len(new_words) < DEDUP_MIN_SHARED:
         return False
@@ -1141,7 +1172,7 @@ def collect(entries, hours, seen, seen_titles, accepted) -> list[dict]:
 
         for art in fetch_naver_news(query, hours):
             st["fetched"] += 1
-            if MAX_PER_COMPANY is not None and count >= MAX_PER_COMPANY:
+            if count >= CANDIDATES_PER_COMPANY:
                 break
 
             if not title_has_company(art["title"], keywords):
@@ -1188,7 +1219,15 @@ def prepare_sector(title: str, spec: dict, hours, seen, seen_titles, accepted) -
     if not candidates:
         return []
 
-    articles = judge_relevance(candidates, spec["context"])
+    judged = judge_relevance(candidates, spec["context"])
+    per_company: dict[str, int] = {}
+    articles: list[dict] = []
+    for a in judged:                      # 네이버 결과가 최신순이라 최신 기사부터 남는다
+        c = a.get("company", "")
+        if per_company.get(c, 0) >= MAX_PER_COMPANY:
+            continue
+        per_company[c] = per_company.get(c, 0) + 1
+        articles.append(a)
     if not articles:
         logger.info("  → LLM 필터 후 남은 기사 없음")
         return []
@@ -1357,7 +1396,7 @@ def main() -> None:
             return
 
     hours = news_window_hours()
-    label = "72h (Mon)" if hours == 72 else "24h"
+    label = "최근 72시간(월요일)" if hours == 72 else "최근 24시간"
     groups = parse_group_arg()
     logger.info("실행 그룹: %s | 언어: %s | 시작 %s KST",
                 ", ".join(groups), BRIEF_LANG, now.strftime("%H:%M:%S"))
