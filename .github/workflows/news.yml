@@ -2,9 +2,14 @@ name: news-brief
 
 on:
   schedule:
-    # 05:37 KST (= 20:37 UTC). 준비를 끝내고 bot.py 가 06:00 까지 기다렸다 발송한다.
-    # ★ cron 줄은 이것 하나만. 줄이 여러 개면 그 수만큼 실행된다.
-    - cron: "37 20 * * *"
+    # ★ 2026-09-28: GitHub cron 은 실제로 2~3시간씩 늦게 돈다
+    #   (05:37 예약 → 07:30~08:30 KST 에 시작해서 브리프가 8시쯤 왔다).
+    #   그래서 새벽 2시대로 크게 당겨 두고, 일찍 깨면 bot.py 가
+    #   05:30 까지 잔 뒤 수집 → 06:00 에 발송한다.
+    # 두 번째 줄은 예비. 하루 1회 가드가 있어서 두 번 오지 않는다
+    # (먼저 돈 쪽이 보내면 나머지는 "오늘 이미 발송됨" 으로 끝난다).
+    - cron: "13 17 * * *"   # 02:13 KST
+    - cron: "43 18 * * *"   # 03:43 KST (예비)
   workflow_dispatch:
     inputs:
       force:
@@ -20,7 +25,7 @@ concurrency:
 jobs:
   brief:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 330   # 새벽에 깨어 05:30 까지 자는 시간 포함 (최대 360)
     steps:
       - uses: actions/checkout@v4
 
@@ -55,7 +60,9 @@ jobs:
           LLM_PROVIDER:            claude_code
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           CLAUDE_CODE_MODEL:       haiku
+          PREP_AT:                 "05:30"
           SEND_AT:                 "06:00"
+          HOLD_MAX_MIN:            "240"
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             EXTRA="--no-hold"
